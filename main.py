@@ -30,11 +30,13 @@ def main():
         with open("data/indiamart_raw.json", "w") as f:
             json.dump([], f)
 
+    # ── Step 2: Alibaba ────────────────────────────────────────────
     logger.info("STEP 2: Scraping Alibaba...")
     try:
         from scrapers.alibaba_scraper import AlibabaScraper
-        ali_data = AlibabaScraper().scrape(pages_per_query=3)
-        with open("data/alibaba_raw.json", "w") as f:
+        ali_scraper = AlibabaScraper()
+        ali_data = ali_scraper.scrape(pages_per_query=2)
+        with open("data/alibaba_raw.json", "w", encoding="utf-8") as f:
             json.dump(ali_data, f, indent=2, ensure_ascii=False)
         logger.info(f"Alibaba: {len(ali_data)} products saved")
     except Exception as e:
