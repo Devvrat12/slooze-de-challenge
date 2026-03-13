@@ -1,133 +1,176 @@
+"""
+indiamart_scraper.py
+---------------------
+Scrapes electronics listings from IndiaMART using Selenium.
+CSS selectors verified against live page structure March 2026.
+"""
+
 import re
 import json
 import logging
+import time
 from pathlib import Path
-from scrapers.base_scraper import BaseScraper
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 logger = logging.getLogger("IndiaMART")
 
-BASE_URL = "https://www.indiamart.com"
-
 ELECTRONICS_CATEGORIES = [
-    {"name": "Mobile Phones",     "path": "/proddetail/mobile-phones.html"},
-    {"name": "LED TV",            "path": "/proddetail/led-tv.html"},
-    {"name": "Laptops",           "path": "/proddetail/laptops.html"},
-    {"name": "CCTV Camera",       "path": "/proddetail/cctv-camera.html"},
-    {"name": "Power Bank",        "path": "/proddetail/power-bank.html"},
-    {"name": "PCB Circuit Board", "path": "/proddetail/printed-circuit-board.html"},
+    {"name": "Mobile Phones",
+        "url": "https://dir.indiamart.com/impcat/mobile-phones.html"},
+    {"name": "LED TV",            "url": "https://dir.indiamart.com/impcat/led-tv.html"},
+    {"name": "Laptops",           "url": "https://dir.indiamart.com/impcat/laptops.html"},
+    {"name": "CCTV Camera",
+        "url": "https://dir.indiamart.com/impcat/cctv-camera.html"},
+    {"name": "Power Bank",
+        "url": "https://dir.indiamart.com/impcat/power-banks.html"},
+    {"name": "PCB Circuit Board",
+        "url": "https://dir.indiamart.com/impcat/printed-circuit-board.html"},
 ]
 
 
 def _parse_price(raw: str):
-    """Extract min/max price from strings like '₹ 5,000 - ₹ 15,000 / Piece'"""
-    if not raw:
-        return None, None, ""
+    """Extract price from strings like '₹ 2,500'"""
+    if not raw or "ask" in raw.lower():
+        return None, None
     raw = raw.replace(",", "").replace("₹", "").strip()
-    unit_match = re.search(r"/([\w\s]+)$", raw)
-    unit = unit_match.group(1).strip() if unit_match else "Unit"
     numbers = re.findall(r"\d+(?:\.\d+)?", raw)
-    price_min = float(numbers[0]) if len(numbers) >= 1 else None
-    price_max = float(numbers[1]) if len(numbers) >= 2 else price_min
-    return price_min, price_max, unit
+    price_min = float(numbers[0]) if numbers else None
+    return price_min, price_min  # IndiaMART shows single price
 
 
-def _parse_moq(raw: str) -> str:
-    """Extract MOQ from strings like 'Min. Order: 10 Piece'"""
+def _parse_rating(raw: str):
+    """Extract rating and review count from '4.1(645)'"""
     if not raw:
-        return "N/A"
-    match = re.search(r"(\d[\d,]*\s*\w+)", raw)
-    return match.group(1).replace(",", "") if match else raw.strip()
+        return None, 0
+    rating_match = re.search(r"(\d+\.\d+)", raw)
+    review_match = re.search(r"\((\d+)\)", raw)
+    rating = float(rating_match.group(1)) if rating_match else None
+    reviews = int(review_match.group(1)) if review_match else 0
+    return rating, reviews
 
 
-class IndiaMARTScraper(BaseScraper):
+def _make_driver():
+    options = webdriver.ChromeOptions()
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    return webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=options
+    )
+
+
+class IndiaMARTScraper:
 
     def __init__(self):
-        super().__init__(source_name="IndiaMART", min_delay=3.0, max_delay=7.0)
+        self.logger = logging.getLogger("IndiaMART")
 
-    def _parse_listing_page(self, soup, category_name: str) -> list:
+    def _parse_page(self, html: str, category_name: str) -> list:
         products = []
+        soup = BeautifulSoup(html, "lxml")
 
-        cards = soup.select(
-            "div.prd-detail") or soup.select("div.product-list-item")
-
+        cards = soup.find_all("li", class_="temp4-card")
         if not cards:
-            logger.warning(f"No product cards found for '{category_name}'.")
+            self.logger.warning(f"No cards found for '{category_name}'")
             return products
 
         for card in cards:
             try:
-                name_el = card.select_one("a.prd-name, h2.lcname, .prd-title")
-                price_el = card.select_one(".prc, .price, .prd-price")
-                moq_el = card.select_one(".moq, .min-qty, .min-order")
-                supplier_el = card.select_one(
-                    ".lcname, .sup-name, .seller-name")
-                loc_el = card.select_one(".lcadr, .loc, .city")
-                rating_el = card.select_one(".star-val, .rating-value")
-                review_el = card.select_one(".rating-count, .review-cnt")
-                url_el = card.select_one("a[href]")
+                # Product name
+                name_el = card.find("a", class_="prdtitle")
 
+                # Price
+                price_el = card.find("span", class_="prc")
+                unit_el = card.find("span", class_="prcut")
+
+                # Supplier
+                supplier_el = card.find("div", class_="wlc1")
+
+                # Rating — span.b contains the number like "4.1"
+                rating_el = card.find("span", class_="b")
+
+                # Review count — div.dag5 contains "4.1(645)"
+                review_el = card.find("div", class_="dag5")
+
+                # URL
+                url = name_el["href"] if name_el and name_el.get(
+                    "href") else "N/A"
+
+                # Parse price
                 raw_price = price_el.get_text(strip=True) if price_el else ""
-                price_min, price_max, price_unit = _parse_price(raw_price)
+                price_min, price_max = _parse_price(raw_price)
+
+                # Parse rating
+                raw_review = review_el.get_text(
+                    strip=True) if review_el else ""
+                _, review_count = _parse_rating(raw_review)
+                rating = float(rating_el.get_text(
+                    strip=True)) if rating_el else None
 
                 products.append({
                     "product_name":      name_el.get_text(strip=True) if name_el else "N/A",
                     "category":          category_name,
                     "price_min":         price_min,
                     "price_max":         price_max,
-                    "price_unit":        price_unit,
+                    "price_unit":        unit_el.get_text(strip=True) if unit_el else "Unit",
                     "currency":          "INR",
-                    "moq":               _parse_moq(moq_el.get_text() if moq_el else ""),
+                    "moq":               "N/A",
                     "supplier_name":     supplier_el.get_text(strip=True) if supplier_el else "N/A",
-                    "supplier_location": loc_el.get_text(strip=True) if loc_el else "N/A",
-                    "supplier_rating":   float(rating_el.get_text(strip=True)) if rating_el else None,
-                    "review_count":      int(re.sub(r"\D", "", review_el.get_text())) if review_el else 0,
-                    "product_url":       BASE_URL + url_el["href"] if url_el else "N/A",
+                    "supplier_location": "India",
+                    "supplier_rating":   rating,
+                    "review_count":      review_count,
+                    "product_url":       url,
                     "source":            "IndiaMART",
                 })
 
             except Exception as e:
-                logger.debug(f"Skipped a card: {e}")
+                self.logger.debug(f"Skipped card: {e}")
                 continue
 
-        logger.info(f"Parsed {len(products)} products for '{category_name}'")
+        self.logger.info(
+            f"Parsed {len(products)} products for '{category_name}'")
         return products
 
-    def scrape_category(self, category: dict, pages: int = 3) -> list:
-        all_products = []
-        for page in range(1, pages + 1):
-            url = BASE_URL + category["path"]
-            params = {"page": page} if page > 1 else {}
-            soup = self.fetch(url, params=params)
-            if not soup:
-                logger.warning(
-                    f"Stopping at page {page} for {category['name']}")
-                break
-            products = self._parse_listing_page(soup, category["name"])
-            if not products:
-                break
-            all_products.extend(products)
-        return all_products
+    def scrape_category(self, driver, category: dict) -> list:
+        self.logger.info(f"Scraping: {category['name']}")
+        driver.get(category["url"])
+        time.sleep(4)
+        driver.execute_script("window.scrollTo(0, 1000);")
+        time.sleep(2)
+        driver.execute_script("window.scrollTo(0, 2000);")
+        time.sleep(2)
+        return self._parse_page(driver.page_source, category["name"])
 
-    def scrape(self, pages_per_category: int = 3) -> list:
+    def scrape(self) -> list:
         all_results = []
-        logger.info(
-            f"Starting IndiaMART scrape — {len(ELECTRONICS_CATEGORIES)} categories")
+        self.logger.info(
+            f"Starting IndiaMART — {len(ELECTRONICS_CATEGORIES)} categories")
 
-        for cat in ELECTRONICS_CATEGORIES:
-            logger.info(f"Scraping: {cat['name']}")
-            products = self.scrape_category(cat, pages=pages_per_category)
-            all_results.extend(products)
+        driver = _make_driver()
+        try:
+            for cat in ELECTRONICS_CATEGORIES:
+                products = self.scrape_category(driver, cat)
+                all_results.extend(products)
+                time.sleep(3)
+        finally:
+            driver.quit()
 
-        logger.info(f"IndiaMART done. Total: {len(all_results)} products")
+        self.logger.info(f"IndiaMART done. Total: {len(all_results)} products")
         return all_results
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
     scraper = IndiaMARTScraper()
-    data = scraper.scrape(pages_per_category=2)
+    data = scraper.scrape()
 
     out_path = Path("data/indiamart_raw.json")
     out_path.parent.mkdir(exist_ok=True)
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     print(f"\nSaved {len(data)} records to {out_path}")
